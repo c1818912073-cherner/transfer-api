@@ -1,9 +1,9 @@
-const Art = require('./art');
 const Input = require('./input');
 const DustSystem = require('./particles');
 const WindField = require('./wind');
 const { createLevel, LevelRuntime } = require('./levels');
 const UI = require('./ui');
+const AudioWorld = require('./audio');
 
 function Main() {
   this.canvas = typeof wx !== 'undefined' && wx.createCanvas
@@ -26,6 +26,7 @@ function Main() {
 
   this.input = new Input(this.canvas);
   this.ui = new UI(this.width, this.height);
+  this.audio = new AudioWorld();
   this.farStars = this._makeFarStars(48);
 
   this.levelDef = createLevel(this.width, this.height, 0);
@@ -33,8 +34,9 @@ function Main() {
   this.dust = new DustSystem(this.width, this.height, this.levelDef.dustCount);
   this.wind = new WindField(this.width, this.height, this.levelDef.streams);
 
+  this._wasBrushing = false;
   this.lastTs = Date.now();
-  this._bindTapRestart();
+  this._bindInput();
   this.loop = this.loop.bind(this);
   this.loop();
 }
@@ -54,12 +56,19 @@ Main.prototype._makeFarStars = function (n) {
   return arr;
 };
 
-Main.prototype._bindTapRestart = function () {
+Main.prototype._bindInput = function () {
   const self = this;
-  const handle = (x, y) => {
+
+  const onEnd = (x, y) => {
+    self.audio.unlock();
+    if (self.ui.state === 'title') self.audio.setMode('title');
+
+    if (self.ui.hitMute(x, y)) {
+      self.audio.toggleMute();
+      return;
+    }
+
     if (self.ui.state === 'title' || self.ui.state === 'clear' || self.ui.state === 'fail') {
-      // Prefer the primary button; also allow a generous lower-half tap
-      // so title / end screens feel responsive on both device and preview.
       const inLower = y > self.height * 0.55;
       if (self.ui.hitPrimary(x, y) || inLower) {
         self.startRound();
@@ -68,20 +77,27 @@ Main.prototype._bindTapRestart = function () {
   };
 
   if (typeof wx !== 'undefined' && wx.onTouchEnd) {
+    wx.onTouchStart(function () {
+      self.audio.unlock();
+      if (self.ui.state === 'title') self.audio.setMode('title');
+    });
     wx.onTouchEnd((e) => {
       const t = e.changedTouches && e.changedTouches[0];
       if (!t) return;
-      handle(t.clientX, t.clientY);
+      onEnd(t.clientX, t.clientY);
     });
   }
 };
 
 Main.prototype.startRound = function () {
+  this.audio.unlock();
   this.levelDef = createLevel(this.width, this.height, 0);
   this.runtime = new LevelRuntime(this.levelDef);
   this.dust = new DustSystem(this.width, this.height, this.levelDef.dustCount);
   this.wind = new WindField(this.width, this.height, this.levelDef.streams);
   this.ui.setState('play');
+  this.audio.setMode('play');
+  this._wasBrushing = false;
 };
 
 Main.prototype.loop = function () {
@@ -106,13 +122,46 @@ Main.prototype.update = function (dt) {
 
   if (this.ui.state === 'play') {
     this.dust.update(dt, this.input, this.wind);
-    this.runtime.update(dt, this.dust);
-    if (this.runtime.cleared) this.ui.setState('clear');
-    else if (this.runtime.failed) this.ui.setState('fail');
+
+    // Brush audio + wind whoosh when crossing strong current
+    if (this.input.active) {
+      if (this.dust.brushStrength > 0.08) {
+        this.audio.brush(this.dust.brushStrength);
+      }
+      if (this.wind.strengthAt(this.input.x, this.input.y) > 28) {
+        this.audio.windWhoosh();
+      }
+      this._wasBrushing = true;
+    } else {
+      this._wasBrushing = false;
+    }
+
+    const events = this.runtime.update(dt, this.dust);
+    for (let i = 0; i < events.length; i++) {
+      const ev = events[i];
+      if (ev.type === 'enter') this.audio.dustEnter();
+      else if (ev.type === 'lock') this.audio.lockIn(ev.order);
+      else if (ev.type === 'clear') {
+        this.ui.setState('clear');
+        this.audio.clear();
+      } else if (ev.type === 'fail') {
+        this.dust.triggerScatter();
+        this.ui.setState('fail');
+        this.audio.fail();
+      }
+    }
   } else if (this.ui.state === 'title') {
-    // Gentle ambient drift on title
     const idleInput = { active: false, x: 0, y: 0, vx: 0, vy: 0 };
-    this.dust.update(dt * 0.6, idleInput, this.wind);
+    this.dust.update(dt * 0.55, idleInput, this.wind);
+    this.runtime._advanceEdges(dt * 0.35);
+  } else if (this.ui.state === 'fail') {
+    // Keep scatter residual motion
+    const idleInput = { active: false, x: 0, y: 0, vx: 0, vy: 0 };
+    this.dust.update(dt, idleInput, this.wind);
+  } else if (this.ui.state === 'clear') {
+    const idleInput = { active: false, x: 0, y: 0, vx: 0, vy: 0 };
+    this.dust.update(dt * 0.4, idleInput, this.wind);
+    this.runtime._advanceEdges(dt);
   }
 };
 
@@ -122,31 +171,29 @@ Main.prototype.draw = function () {
   this.ui.drawFarStars(ctx, this.farStars);
   this.wind.draw(ctx);
 
-  if (this.ui.state !== 'title') {
-    this.ui.drawConstellation(ctx, this.runtime);
-  } else {
-    // Soft preview of constellation on title
-    this.ui.drawConstellation(ctx, this.runtime);
-  }
+  this.ui.drawConstellation(ctx, this.runtime, {
+    preview: this.ui.state === 'title',
+  });
 
   this.dust.draw(ctx);
-  this.ui.drawHUD(ctx, this.runtime);
+  this.ui.drawHUD(ctx, this.runtime, this.audio.muted);
 
   if (this.ui.state === 'title') this.ui.drawTitle(ctx);
   else if (this.ui.state === 'clear') this.ui.drawClear(ctx);
   else if (this.ui.state === 'fail') this.ui.drawFail(ctx);
 
-  // Finger glow while brushing
+  // Finger aura — anticipates brush presence
   if (this.ui.state === 'play' && this.input.active) {
+    const pulse = 70 + this.dust.brushStrength * 18;
     const g = ctx.createRadialGradient(
       this.input.x, this.input.y, 0,
-      this.input.x, this.input.y, 70
+      this.input.x, this.input.y, pulse
     );
-    g.addColorStop(0, 'rgba(255, 230, 180, 0.12)');
+    g.addColorStop(0, `rgba(255, 230, 180, ${(0.1 + this.dust.brushStrength * 0.1).toFixed(3)})`);
     g.addColorStop(1, 'rgba(0,0,0,0)');
     ctx.fillStyle = g;
     ctx.beginPath();
-    ctx.arc(this.input.x, this.input.y, 70, 0, Math.PI * 2);
+    ctx.arc(this.input.x, this.input.y, pulse, 0, Math.PI * 2);
     ctx.fill();
   }
 };
